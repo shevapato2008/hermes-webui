@@ -53,7 +53,7 @@ def _content_has_part_type(content, part_types):
     )
 
 
-def _is_context_compression_marker(message):
+def is_context_compression_marker(message):
     """Return true for synthetic compression/reference cards, not user turns."""
     if not isinstance(message, dict):
         return False
@@ -68,7 +68,13 @@ def _is_context_compression_marker(message):
         text.startswith("[context compaction")
         or text.startswith("context compaction")
         or text.startswith("[your active task list was preserved across context compression]")
+        or text.startswith("[session arc summary")
     )
+
+
+def _is_context_compression_marker(message):
+    """Backward-compatible alias for callers that have not switched yet."""
+    return is_context_compression_marker(message)
 
 
 def visible_messages_for_anchor(messages, *, auto_compression: bool = False):
