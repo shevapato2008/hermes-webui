@@ -288,6 +288,71 @@ def active_stream_id_for_session(session_id: str) -> Optional[str]:
     return None
 
 
+def persisted_message_count_for_session(session_id: str) -> Optional[int]:
+    """Cheap, metadata-only persisted ``message_count`` for *session_id*, or None.
+
+    Companion to ``active_stream_id_for_session`` for the per-session SSE
+    on-subscribe self-heal. ``active_stream_id_for_session`` recovers a turn
+    that is live RIGHT NOW (replay ``server_turn_started``). But a
+    SERVER-initiated turn (self-wake / cron / restart hook) can start AND
+    finish entirely inside an SSE gap: the fire-and-forget
+    ``server_turn_started`` reached no subscriber AND the run already cleared
+    from ``ACTIVE_RUNS`` by the time the tab reconnects, so the replay finds
+    nothing (returns None) and the tab's transcript stays stale until a hard
+    refresh — the reported visible-tab defect. To detect that case the handler
+    compares the freshly-(re)subscribed tab's last-known count against this
+    persisted count; a server that is AHEAD means a turn landed during the gap.
+
+    Reads via ``metadata_only=True`` so it never parses the full transcript
+    (this runs on every per-session SSE (re)connect). The persisted count is
+    written by ``Session.save`` as ``meta['message_count'] = len(messages)`` —
+    the SAME basis the frontend's ``S.session.message_count`` is built from —
+    so the comparison is apples-to-apples. Returns None when the count is
+    unknown (legacy sidecars without a persisted count); the caller treats
+    None as "cannot tell, do nothing", never as a trigger.
+    """
+    try:
+        from api.models import get_session
+
+        s = get_session(session_id, metadata_only=True)
+        count = getattr(s, "_metadata_message_count", None)
+        if count is None:
+            msgs = getattr(s, "messages", None)
+            count = len(msgs) if isinstance(msgs, list) and msgs else None
+        return int(count) if count is not None else None
+    except Exception:
+        logger.debug(
+            "persisted_message_count_for_session lookup failed for %s",
+            session_id,
+            exc_info=True,
+        )
+        return None
+
+
+def should_emit_session_updated(
+    subscriber_known_count: Optional[int],
+    persisted_count: Optional[int],
+) -> bool:
+    """Gate for the per-session SSE "finished during the gap" self-heal emit.
+
+    Single source of truth shared by the SSE handler and its tests so the two
+    cannot drift (the handler MUST call this, not inline the comparison).
+    Emit a ``session-updated`` frame ONLY when:
+      * the (re)subscribing tab reported a last-known count (``?known_count``),
+        AND
+      * the persisted server-side count is known, AND
+      * the server is STRICTLY ahead (a turn landed during the gap).
+    A missing known count (tab didn't report), an unknown persisted count
+    (legacy sidecar), or an equal/behind count all return False — never a
+    spurious reload.
+    """
+    if subscriber_known_count is None:
+        return False
+    if persisted_count is None:
+        return False
+    return persisted_count > subscriber_known_count
+
+
 def _reaper_loop() -> None:
     logger.info("SessionChannel reaper thread started")
     while not _REAPER_STOP.is_set():
@@ -350,17 +415,28 @@ def _truncate(text: str, limit: int) -> str:
     return s[:limit] + "\n…(truncated)"
 
 
-def format_wakeup_prompt(evt: dict) -> str:
+def format_wakeup_prompt(evt: object) -> str | None:
     """Build the synthetic [IMPORTANT: …] message the agent will see.
 
     Mirrors ``cli._format_process_notification`` so wakeup payloads look the
     same in CLI and WebUI sessions.
     """
+    if not isinstance(evt, dict) or not evt:
+        return None
+
     evt_type = evt.get("type", "completion")
-    sid = evt.get("session_id", "unknown")
-    cmd = evt.get("command", "unknown")
+    sid = str(evt.get("session_id") or "").strip()
+    cmd = str(evt.get("command") or "").strip()
+    # The current server-side wakeup drain drops global watch-overflow events
+    # before this formatter because they intentionally carry no session_key.
+    # Keep this branch defensive so any future routable overflow summary is not
+    # mis-rendered as a fake process completion.
+    if evt_type in {"watch_overflow_tripped", "watch_overflow_released"}:
+        msg = str(evt.get("message") or "").strip()
+        return f"[IMPORTANT: {msg}]" if msg else None
     if evt_type == "watch_disabled":
-        return f"[IMPORTANT: {evt.get('message', '')}]"
+        msg = str(evt.get("message") or "").strip()
+        return f"[IMPORTANT: {msg}]" if msg else None
     if evt_type == "watch_match":
         pat = evt.get("pattern", "?")
         out = _truncate(evt.get("output", ""), 4000)
@@ -373,6 +449,31 @@ def format_wakeup_prompt(evt: dict) -> str:
         if sup:
             body += f"\n({sup} earlier matches were suppressed by rate limit)"
         return body + "]"
+    if evt_type == "async_delegation":
+        # A background ``delegate_task`` completion. The agent-side formatter
+        # renders these; delegate to it so the subagent result re-enters the
+        # parent conversation instead of being silently dropped (#4912).
+        try:
+            from tools.process_registry import (
+                format_process_notification as _agent_fmt,
+            )
+            result = _agent_fmt(evt)
+            if result:
+                return result
+        except Exception:
+            logger.debug(
+                "agent-side format_process_notification fallback failed for "
+                "evt_type=%s",
+                evt_type,
+                exc_info=True,
+            )
+        return None
+    if evt_type != "completion":
+        return None
+
+    if not (sid or cmd or "exit_code" in evt or evt.get("output")):
+        return None
+
     # Default: completion event
     exit_code = evt.get("exit_code", "?")
     out = _truncate(evt.get("output", ""), 4000)
@@ -880,7 +981,8 @@ def _process_one(evt: dict) -> None:
         # `{session_id, task_id, completed_at, summary?, event_id}`, so
         # we derive the prompt directly from the evt here (same source the
         # prior _build_payload used).
-        wakeup_prompt = format_wakeup_prompt(evt).strip()
+        wakeup_prompt_raw = format_wakeup_prompt(evt)
+        wakeup_prompt = wakeup_prompt_raw.strip() if wakeup_prompt_raw else ""
         if wakeup_prompt:
             if _session_has_active_turn(session_id):
                 # Defer-path fix: persist the prompt so a turn-teardown
