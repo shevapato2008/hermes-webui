@@ -342,6 +342,34 @@ def test_git_diff_skips_repo_local_clean_filter_without_destructive_mode(tmp_pat
     assert not marker.exists()
 
 
+def test_status_check_does_not_take_the_index_lock(tmp_path, monkeypatch):
+    """A background status check must not rewrite the index (#8520).
+
+    Rewriting needs .git/index.lock, and a status killed at its timeout
+    could leave that lock behind.
+    """
+    import os
+
+    from api.workspace_git import _dirty_worktree, resolve_git_context
+
+    # Pin the parent setting on, so the test can't pass just because the
+    # runner already has optional locks turned off.
+    monkeypatch.setenv("GIT_OPTIONAL_LOCKS", "1")
+    repo = _init_repo(tmp_path / "repo")
+    (repo / "tracked.txt").write_text("one\n", encoding="utf-8")
+    _commit_all(repo)
+    # Same content, newer mtime: plain `git status` would refresh and
+    # rewrite the index here.
+    tracked = repo / "tracked.txt"
+    later = tracked.stat().st_mtime + 120
+    os.utime(tracked, (later, later))
+    index = repo / ".git" / "index"
+    before = index.read_bytes()
+
+    assert _dirty_worktree(resolve_git_context(repo)) is False
+    assert index.read_bytes() == before
+
+
 def test_git_status_reports_untracked_files_inside_directories(tmp_path):
     from api.workspace_git import git_discard, git_status
 
@@ -2221,8 +2249,10 @@ def test_git_env_scrub_removes_redirecting_vars_and_preserves_temp_index(monkeyp
 
     monkeypatch.setenv("GIT_DIR", "/tmp/evil-git-dir")
     monkeypatch.setenv("GIT_WORK_TREE", "/tmp/evil-work-tree")
+    monkeypatch.setenv("GIT_CONFIG", "/tmp/evil-repo-config")
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", "/tmp/evil-config")
     monkeypatch.setenv("GIT_CONFIG_SYSTEM", "/tmp/evil-system-config")
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
     monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
     monkeypatch.setenv("GIT_CONFIG_KEY_0", "core.sshCommand")
     monkeypatch.setenv("GIT_CONFIG_VALUE_0", "ssh -i /tmp/evil-key")
@@ -2231,14 +2261,18 @@ def test_git_env_scrub_removes_redirecting_vars_and_preserves_temp_index(monkeyp
     monkeypatch.setenv("SSH_ASKPASS", "/tmp/evil-ssh-askpass")
     monkeypatch.setenv("GIT_SSH", "/tmp/evil-ssh")
     monkeypatch.setenv("GIT_SSH_COMMAND", "ssh -i /tmp/evil-key")
+    monkeypatch.setenv("GIT_PROXY_COMMAND", "/tmp/evil-proxy")
     monkeypatch.setenv("GIT_TERMINAL_PROMPT", "1")
+    monkeypatch.setenv("SSH_AUTH_SOCK", "/tmp/trusted-agent.sock")
 
     env = _clean_git_env({"GIT_INDEX_FILE": "/tmp/hermes-index"})
 
     assert "GIT_DIR" not in env
     assert "GIT_WORK_TREE" not in env
+    assert "GIT_CONFIG" not in env
     assert "GIT_CONFIG_GLOBAL" not in env
     assert "GIT_CONFIG_SYSTEM" not in env
+    assert "GIT_CONFIG_NOSYSTEM" not in env
     assert "GIT_CONFIG_COUNT" not in env
     assert "GIT_CONFIG_KEY_0" not in env
     assert "GIT_CONFIG_VALUE_0" not in env
@@ -2247,7 +2281,9 @@ def test_git_env_scrub_removes_redirecting_vars_and_preserves_temp_index(monkeyp
     assert "SSH_ASKPASS" not in env
     assert "GIT_SSH" not in env
     assert "GIT_SSH_COMMAND" not in env
+    assert "GIT_PROXY_COMMAND" not in env
     assert env["GIT_TERMINAL_PROMPT"] == "0"
+    assert env["SSH_AUTH_SOCK"] == "/tmp/trusted-agent.sock"
     assert env["GIT_INDEX_FILE"] == "/tmp/hermes-index"
 
 
@@ -2518,12 +2554,12 @@ def test_dirty_worktree_uses_filter_neutralization(tmp_path):
 
 
 def test_run_git_passes_windows_hide_flags(monkeypatch, tmp_path):
-    """_run_git must pass creationflags=_windows_hide_flags() so git child
+    """_run_git must pass creationflags=windows_hide_flags() so git child
     processes don't accumulate visible console windows on Windows (#5692).
     windows_hide_flags() is 0 on non-Windows, so this is a safe no-op there;
     the test asserts the kwarg is wired regardless of platform."""
     import api.workspace_git as wg
-    from api.workspace_git import _windows_hide_flags
+    from api.subprocess_utils import windows_hide_flags
 
     repo = _init_repo(tmp_path / "repo")
     (repo / "f.txt").write_text("x\n", encoding="utf-8")
@@ -2539,17 +2575,17 @@ def test_run_git_passes_windows_hide_flags(monkeypatch, tmp_path):
     monkeypatch.setattr(wg.subprocess, "run", fake_run)
     wg._run_git(repo, ["rev-parse", "HEAD"])
 
-    assert captured.get("creationflags") == _windows_hide_flags(), (
-        "_run_git must pass creationflags=_windows_hide_flags() to subprocess.run"
+    assert captured.get("creationflags") == windows_hide_flags(), (
+        "_run_git must pass creationflags=windows_hide_flags() to subprocess.run"
     )
 
 
 def test_config_names_for_scope_passes_windows_hide_flags(monkeypatch, tmp_path):
-    """_config_names_for_scope must also pass creationflags=_windows_hide_flags()
+    """_config_names_for_scope must also pass creationflags=windows_hide_flags()
     (#5692) — the git-config probe spawns a console window on Windows too."""
     import re as _re
     import api.workspace_git as wg
-    from api.workspace_git import _windows_hide_flags
+    from api.subprocess_utils import windows_hide_flags
 
     repo = _init_repo(tmp_path / "repo")
 
@@ -2570,6 +2606,6 @@ def test_config_names_for_scope_passes_windows_hide_flags(monkeypatch, tmp_path)
         ignore_unsupported=True,
     )
 
-    assert captured.get("creationflags") == _windows_hide_flags(), (
-        "_config_names_for_scope must pass creationflags=_windows_hide_flags()"
+    assert captured.get("creationflags") == windows_hide_flags(), (
+        "_config_names_for_scope must pass creationflags=windows_hide_flags()"
     )
